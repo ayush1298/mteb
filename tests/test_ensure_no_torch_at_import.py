@@ -233,32 +233,40 @@ def test_model_meta_dtypes_are_named_not_torch_objects() -> None:
 
 
 def test_model_implementations_declare_no_import_time_torch_dtypes() -> None:
-    """No model file may evaluate a `torch.<dtype>` at import time; use `OutputDType` instead."""
+    """No model file may evaluate a `torch.<dtype>` at import time; use `OutputDType` instead.
+
+    Everything outside a function body runs at import -- module-level `ModelMeta(...)` calls,
+    class bodies, decorators and signature defaults -- so only function bodies are exempt.
+    """
     import ast
 
-    dtypes = {"float16", "float32", "bfloat16", "uint8", "int8", "float64"}
+    from mteb.types import OutputDType
+
+    # every dtype OutputDType can name (including the float8 variants), plus float64
+    dtypes = {member.value for member in OutputDType} | {"float64"}
+
     offenders = []
     for path in sorted(
         (_REPO_ROOT / "mteb/models/model_implementations").rglob("*.py")
     ):
         tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            # only signature defaults execute at import; bodies are evaluated lazily
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for default in [*node.args.defaults, *node.args.kw_defaults]:
-                if default is None:
-                    continue
-                for sub in ast.walk(default):
-                    if (
-                        isinstance(sub, ast.Attribute)
-                        and isinstance(sub.value, ast.Name)
-                        and sub.value.id == "torch"
-                        and sub.attr in dtypes
-                    ):
-                        offenders.append(f"{path.name}:{sub.lineno} torch.{sub.attr}")
+        body_lines = {
+            line
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for line in range(node.body[0].lineno, node.end_lineno + 1)
+        }
+        offenders += [
+            f"{path.name}:{node.lineno} torch.{node.attr}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "torch"
+            and node.attr in dtypes
+            and node.lineno not in body_lines
+        ]
 
     assert not offenders, (
-        "these default arguments evaluate a torch dtype at import time; use the matching "
-        f"OutputDType member instead: {offenders}"
+        "these evaluate a torch dtype at import time; use the matching OutputDType member "
+        f"instead: {offenders}"
     )
